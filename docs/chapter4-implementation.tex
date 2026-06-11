@@ -1,0 +1,318 @@
+\chapter{系统实现}
+
+\section{系统架构}
+
+本系统采用前后端分离架构。前端使用 Vue 3 Composition API + Vite 8 + TypeScript + Tailwind CSS v4 构建响应式界面，负责用户交互与数据可视化；后端基于 Spring Boot 2.7.15 + Spring Data JPA 提供 RESTful API 服务，处理数据库操作与业务逻辑；数据库使用 MariaDB 存储标准化舆情数据，Redis 提供缓存加速，结合应用层内存缓存构成二级缓存体系。
+
+数据流程为：MediaCrawler 爬虫获取原始数据 $\rightarrow$ Kafka 消息队列缓冲 $\rightarrow$ Spark Streaming 流式消费并进行清洗、标准化、热度计算与情感分析 $\rightarrow$ 写入 MariaDB $\rightarrow$ Spring Boot 后端 API 查询 $\rightarrow$ 前端 ECharts 可视化展示。
+
+在实际落地过程中，初期尝试过单进程直接推送数据到处理层，但当数据量突增时处理模块无法及时消费，造成数据堆积与丢失。因此引入单机部署的 ZooKeeper + Kafka 构建消息缓冲层，实现采集端与处理端的解耦，大幅提升了系统稳定性与吞吐量。
+
+\section{数据采集与预处理}
+
+\subsection{数据采集}
+
+本研究基于 MediaCrawler 框架，分别实现 NGA 论坛与 B 站双平台的定时增量爬取。B 站爬虫通过搜索关键词获取视频列表及其评论，采集字段包括视频标题、描述、评论内容、点赞数、投币数、收藏数、分享数、弹幕数等。NGA 爬虫通过论坛搜索获取帖子及其回复，采集字段包括帖子标题、作者、回复列表及唯一标识等。
+
+爬虫输出的原始数据封装为 JSON 格式发送至 Kafka 统一主题，通过 ZooKeeper 协调消费位点，实现异步、稳定、高吞吐的数据传输。B 站与 NGA 的原始字段结构不同，分别如图~\ref{fig:nga-field-4-2} 与图~\ref{fig:bilibili-field-4-3} 所示。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.45\textwidth]{E:/download/数据采集与缓冲架构示意图.drawio.png}
+    \caption{数据采集与缓冲架构示意图}
+    \label{fig:arch-4-1}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.4\textwidth]{E:/download/NGA爬虫爬取数据.png}
+    \caption{NGA论坛爬虫采集字段示意图}
+    \label{fig:nga-field-4-2}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.4\textwidth]{E:/download/B站爬虫爬取数据.png}
+    \caption{B站爬虫采集字段示意图}
+    \label{fig:bilibili-field-4-3}
+\end{figure}
+
+\subsection{Spark 流式数据清洗}
+
+系统基于 Spark 3.3.0 Structured Streaming 消费 Kafka 消息，按批次处理原始数据。清洗流程在 \texttt{UnifiedDataCleaner} 对象中实现，依次完成消息解析与基础校验、文本清洗（正则去除 HTML 标签与特殊符号）、时间标准化（统一为 \texttt{yyyy-MM-dd HH:mm:ss} 格式）、字段映射与默认值填充、文本长度过滤。文本清洗使用正则表达式去除 HTML 标签、URL 链接、特殊符号等非中文数字字符，空文本标记为 null 并在后续过滤。清洗完成后，双平台数据在字段名称、数据类型与语义上实现完全对齐。
+
+\subsection{热度计算}
+\label{sec:hotness-calculation}
+
+系统根据双平台互动能力的差异采用不同加权公式。B 站支持点赞、评论、投币、收藏、分享等多种互动，NGA 论坛仅支持评论互动。权重系数通过配置文件管理，Scala 代码中的配置加载实现如下。
+
+\begin{lstlisting}[caption=热度权重配置管理, label=code:hot-config]
+object ConfigManager {
+  object HotWeight {
+    val biliLike = config.getDouble("hot.weight.bili.like")          // 1.0
+    val biliComment = config.getDouble("hot.weight.bili.comment")    // 1.5
+    val biliCoinFavoriteShare = config.getDouble("hot.weight.bili.coinFavoriteShare") // 1.2
+    val ngaComment = config.getDouble("hot.weight.nga.comment")      // 1.5
+  }
+}
+\end{lstlisting}
+
+B 站热度公式为 $Hot_{\text{raw}} = W_1 \cdot L + W_2 \cdot C + W_3 \cdot (Co + F + S) + 1.0$，NGA 为 $Hot_{\text{raw}} = W_2 \cdot C + 1.0$。归一化阶段采用分平台独立 Min-Max 策略，B 站区间 $[0, 50000]$，NGA 区间 $[0, 5000]$，归一化函数实现如下。
+
+\begin{lstlisting}[caption=归一化函数实现, label=code:normalize]
+private def normalizeHotScore(hotRaw: Column, min: Double, max: Double): Column = {
+    val normalized = (hotRaw - min) / (max - min)
+    when(normalized < 0, 0.0).when(normalized > 1, 1.0).otherwise(normalized)
+}
+\end{lstlisting}
+
+\subsection{情感分析}
+
+情感分析服务基于 Python Flask 框架独立部署，加载 ModelScope 平台的 StructBERT 预训练模型。服务通过 HTTP POST 接口接收文本，返回情感标签与得分。
+
+\begin{lstlisting}[language=Python, caption=情感分析服务实现, label=code:sentiment-service]
+from modelscope.pipelines import pipeline
+from modelscope.utils.constant import Tasks
+
+_sentiment_pipeline = None
+
+def get_pipeline():
+    global _sentiment_pipeline
+    if _sentiment_pipeline is None:
+        _sentiment_pipeline = pipeline(
+            task=Tasks.sentiment_classification,
+            model='damo/nlp_structbert_sentiment-classification_chinese-base'
+        )
+    return _sentiment_pipeline
+
+@app.route('/sentiment', methods=['POST'])
+def analyze():
+    data = request.get_json()
+    text = data['text'].strip()
+    if len(text) > 200:        # 限制输入长度降低延迟
+        text = text[:200]
+    pipe = get_pipeline()
+    result = pipe(text)
+    label = result['labels'][0]
+    score = result['scores'][0]
+    # 映射为 [-1.0, 1.0] 区间的 sentiment_score
+    if label in ['positive', '正面']:
+        sentiment_score = score
+    elif label in ['negative', '负面']:
+        sentiment_score = -score
+    else:
+        sentiment_score = 0.0
+    return jsonify({'label': label, 'sentiment_score': sentiment_score})
+\end{lstlisting}
+
+Spark 清洗流程中通过 Scala UDF 调用该服务，对每条数据的文本内容发送 HTTP POST 请求。
+
+\begin{lstlisting}[caption=Spark 调用情感分析服务的 UDF 实现, label=code:sentiment-udf]
+class SentimentServiceClient(serviceUrl: String) {
+    def getSentimentScore(text: String): Float = {
+        val url = new URL(s"$serviceUrl/sentiment")
+        val conn = url.openConnection().asInstanceOf[HttpURLConnection]
+        conn.setRequestMethod("POST")
+        conn.setRequestProperty("Content-Type", "application/json")
+        val requestBody = s"""{"text": "${text.replace("\"", "\\\"")}"}"""
+        val writer = new OutputStreamWriter(conn.getOutputStream)
+        writer.write(requestBody); writer.flush(); writer.close()
+        val reader = new BufferedReader(
+            new InputStreamReader(conn.getInputStream, "UTF-8"))
+        val response = reader.lines().toArray.mkString("\n")
+        val json = new JSONObject(response)
+        json.getDouble("sentiment_score").toFloat
+    }
+}
+\end{lstlisting}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.5\textwidth]{E:/download/标准数据输出表.png}
+    \caption{数据标准化后最终保存字段示意图}
+    \label{fig:final-fields-4-4}
+\end{figure}
+
+\section{前端实现}
+
+前端基于 Vue 3 Composition API + Vite 8 + TypeScript 构建，使用 Tailwind CSS v4 实现响应式布局，ECharts 5.6 与 echarts-wordcloud 插件进行数据可视化。系统共包含 5 个核心 Vue 组件，全部挂载于 \texttt{App.vue} 主页面中，采用 Tailwind 响应式网格实现卡片式布局。
+
+顶部导航栏包含关键词下拉选择器（21 个预设手机游戏关键词）与时间范围按钮组（1 天至全部共 8 个选项）。核心指标区展示平均热度指数卡片（含环比变化与迷你趋势折线图）与情感分布卡片（三色百分比进度条）。可视化图表区包含渠道声量分布饼图、实时热度与预测折线图（叠加 XGBoost 预测结果的虚线趋势）以及热点词云图。信息流区按时间与热度综合排序展示最新 6 条舆情信息。
+
+\section{后端实现}
+
+\subsection{框架与API}
+
+后端基于 Spring Boot 2.7.15 框架，使用 Spring Data JPA 简化数据库操作。系统提供 6 个 RESTful API 端点，均在 \texttt{/api/opinion/} 路径下，包括指标查询（\texttt{/metrics}）、渠道分布（\texttt{/channel}）、声量走势（\texttt{/trend}）、热词统计（\texttt{/words}）、信息列表（\texttt{/list}）与健康检查（\texttt{/health}）。所有接口接收 \texttt{keyword} 与 \texttt{timeRange} 两个查询参数，返回统一格式的 \texttt{ApiResponse<T>} 响应体。
+
+\subsection{缓存架构}
+
+系统采用两级缓存策略。第一级为应用层内存缓存，使用 ConcurrentHashMap 存储查询结果，5 秒过期，同一缓存键的并发请求通过 \texttt{synchronized} 同步避免重复查库。第二级为 Redis 缓存，通过 \texttt{RedisTemplate} 封装，5 分钟默认过期时间，不可用时降级打印警告，保证系统在缓存失效时仍可正常运行。
+
+\subsection{预测集成}
+
+后端通过 RestTemplate 调用 Python 预测服务，在 Python 服务不可用时返回兜底数据。
+
+\begin{lstlisting}[language=Java, caption=后端调用 Python 预测服务, label=code:predict-integration]
+public Map<String, Object> predictTrend(String keyword) {
+    try {
+        String url = pythonServiceUrl + "?keyword="
+            + URLEncoder.encode(keyword, StandardCharsets.UTF_8);
+        Map<String, Object> response = restTemplate.getForObject(url, Map.class);
+        if (response != null && "success".equals(response.get("message"))) {
+            return (Map<String, Object>) response.get("data");
+        }
+    } catch (Exception e) {
+        log.warn("Python预测服务不可用: {}", e.getMessage());
+    }
+    // 兜底数据
+    Map<String, Object> fallback = new LinkedHashMap<>();
+    fallback.put("keyword", keyword);
+    fallback.put("trend", "平稳");
+    fallback.put("trend_code", 1);
+    fallback.put("probability", 0.5);
+    return fallback;
+}
+\end{lstlisting}
+
+\section{基于 XGBoost 的热度预测}
+
+热度预测功能以独立 Python Flask 服务运行（端口 5000），基于 XGBoost 分类模型实现。模型使用 25 维特征对未来 2 小时窗口的热度趋势进行分类预测。
+
+\subsection{特征工程与预测}
+
+服务从数据库加载指定关键词前 3 天的数据，按 2 小时间隔构造滑动窗口。核心预测流程如下。
+
+\begin{lstlisting}[language=Python, caption=XGBoost 预测服务主流程, label=code:predict-main]
+def predict_trend(keyword):
+    # 获取数据库中最新的数据时间
+    latest_time = get_latest_data_time(keyword)
+    if latest_time is None:
+        return {'trend': '未知', 'trend_code': -1, 'probability': 0.0}
+
+    # 对齐到最近的2小时窗口
+    hours = latest_time.hour - (latest_time.hour % 2)
+    window_start = latest_time.replace(hour=hours, minute=0, second=0, microsecond=0)
+
+    # 加载前3天数据
+    rows = load_data_from_db(keyword, window_start)
+
+    # 特征工程
+    feature = feature_engineering(rows, window_start, keyword)
+    if feature is None:
+        return {'trend': '未知', 'trend_code': -1, 'probability': 0.0}
+
+    # 构造特征矩阵并预测
+    feature_values = [feature[col] for col in feature_columns]
+    feature_matrix = np.array([feature_values])
+    prediction = model.predict(feature_matrix)[0]
+    probability = model.predict_proba(feature_matrix)[0]
+
+    trend = class_map.get(int(prediction), '未知')
+    prob = float(probability[int(prediction)])
+
+    # 概率加权估算预测变化率
+    change_rate_map = {0: -0.15, 1: 0.0, 2: 0.15}
+    sorted_classes = sorted(class_map.keys())
+    weighted_change_rate = sum(
+        change_rate_map.get(c, 0.0) * float(probability[i])
+        for i, c in enumerate(sorted_classes)
+    )
+    if prob > 0.8:   # 高置信度直接使用类别变化率
+        weighted_change_rate = change_rate_map.get(int(prediction), 0.0)
+
+    predicted_hot_raw = int(feature['total_hot_raw'] * (1 + weighted_change_rate))
+
+    return {
+        'trend': trend, 'trend_code': int(prediction),
+        'probability': prob, 'predicted_hot_raw': predicted_hot_raw,
+        'predicted_change_rate': round(weighted_change_rate, 4)
+    }
+\end{lstlisting}
+
+特征工程部分按窗口聚合计算统计量，并构造滞后特征与滚动统计特征。
+
+\begin{lstlisting}[language=Python, caption=特征工程实现, label=code:feature-eng]
+def feature_engineering(rows, window_start, keyword):
+    # 按2小时窗口分组
+    window_data = {}
+    for row in rows:
+        pub_time = row['publish_time']
+        window_hour = pub_time.hour - (pub_time.hour % 2)
+        window_time = pub_time.replace(hour=window_hour, minute=0, second=0, microsecond=0)
+        window_data.setdefault(window_time, []).append(row)
+
+    sorted_windows = sorted(window_data.keys())
+    current_window_data = window_data[sorted_windows[-1]]
+
+    # 窗口聚合特征
+    total_hot = sum(row['hot_score'] for row in current_window_data)
+    total_hot_raw = sum(row.get('hot_raw', 0) or 0 for row in current_window_data)
+    count = len(current_window_data)
+    avg_like = sum(row['like_count'] for row in current_window_data) / count
+    avg_comment = sum(row['comment_count'] for row in current_window_data) / count
+    avg_sentiment = sum(row['sentiment_score'] for row in current_window_data) / count
+
+    # 滞后特征 (lag_1, lag_2, lag_3)
+    for lag in [1, 2, 3]:
+        lag_idx = -1 - lag
+        if abs(lag_idx) <= len(sorted_windows):
+            lag_data = window_data.get(sorted_windows[lag_idx], [])
+            # 计算 lag_{lag}_total_hot, avg_like, avg_comment, avg_sentiment
+            # ...
+
+    # 滚动统计：最近6个窗口的均值和标准差
+    rolling_windows = sorted_windows[-7:-1]  # 当前窗口前6个
+    rolling_total_hots = [sum(row['hot_score'] for row in window_data[w])
+                          for w in rolling_windows]
+    rolling_mean = np.mean(rolling_total_hots)
+    rolling_std  = np.std(rolling_total_hots)
+
+    # 时间特征
+    hour = window_start.hour
+    day_of_week = window_start.weekday()
+    is_weekend = 1 if day_of_week >= 5 else 0
+    month = window_start.month
+
+    return { 'total_hot': total_hot, 'total_hot_raw': total_hot_raw,
+             'count': count, 'avg_like': avg_like, 'avg_comment': avg_comment,
+             'avg_sentiment': avg_sentiment, 'hour': hour,
+             'day_of_week': day_of_week, 'is_weekend': is_weekend, 'month': month }
+\end{lstlisting}
+
+模型训练参数配置为：目标函数 \texttt{multi:softprob}、学习率 0.03、树深度 5、采样率 0.85、列采样率 0.9、L1 正则化 0.5、L2 正则化 2.0、迭代次数 500。标签基于热度变化率划分为上升（$>+10\%$）、平稳（$[-10\%, +10\%]$）、下降（$<-10\%$）三类。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=1.0\textwidth]{E:/bishe/model_training/model_performance_comparison.png}
+    \caption{XGBoost模型与其他模型精度对比图}
+    \label{fig:xgboost-flow}
+\end{figure}
+
+\section{功能演示}
+
+系统主页面分为四个功能区域，每个区域包含一个或多个信息卡片，各卡片职责明确、数据联动。
+
+顶部导航栏左侧为关键词下拉选择器，包含 21 个预设手机游戏关键词；右侧为时间范围按钮组，提供 1 天、3 天、7 天、14 天、30 天、90 天、180 天及全部共 8 个选项。选择关键词或时间范围后，页面所有卡片统一刷新，加载过程中各卡片独立显示旋转加载动画。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.75\textwidth]{E:/keyword下拉列表.png}
+    \caption{keyword下拉列表展示}
+\end{figure}
+
+核心指标区包含两张并列卡片：
+
+\textbf{平均热度指数卡片}展示当前关键词在选定时间范围内所有舆情内容的平均热度值，以及相比上一同周期的环比变化百分比。卡片内嵌迷你热度趋势折线图，使用户可以快速判断整体舆情热度水平及其走向，识别热度处于上升通道还是下降通道。
+
+\textbf{情感分布卡片}以三色百分比进度条展示正面（绿色）、中性（黄色）、负面（红色）三类情感的占比分布，使用户能够一键掌握所选关键词下的舆论情感倾向，判断口碑是积极、消极还是以中性为主。
+
+可视化图表区包含三张图表卡片：
+
+\textbf{渠道声量分布饼图}以环形饼图展示 B 站与 NGA 在指定时间范围内的数据量占比，悬停时可查看各平台的具体比例。用户可据此判断不同平台对特定关键词的讨论活跃度差异。
+
+\textbf{实时热度与预测折线图}以折线图展示选定时间范围内的声量走势，同时叠加 XGBoost 模型对下一个 2 小时窗口的热度预测值（以蓝色虚线与图钉标记展示），右上角标注趋势方向（上升/平稳/下降）及置信度数值。用户可据此了解历史热度变化规律，并对近期走势形成预判。
+
+\textbf{热点词云图}基于 echarts-wordcloud 插件实现，以词云形式展示高频关键词，词频越高字号越大，悬停时显示词语及其权重。用户可直观识别当前讨论的核心话题与焦点词汇。
+
+信息流区以\textbf{信息列表}形式展示最新舆情信息，按时间倒序与热度降序综合排序，每条信息包含标题、来源平台、发布时间、情感标签与热度数值，最多展示 6 条。用户可通过该区域快速浏览最新讨论动态，了解当前最受关注的舆情内容。

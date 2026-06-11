@@ -1,0 +1,4 @@
+{
+  "bilibili": {"cap": 10.81, "note": "log(1+P95) = log(1+49424)"},
+  "nga": {"cap": 2.64, "note": "log(1+P95) = log(1+13)"}
+}

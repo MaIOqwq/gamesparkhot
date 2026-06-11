@@ -1,0 +1,38 @@
+{
+  "nga_crawler": {
+    "keywords": ["原神", "崩坏星穹铁道", "明日方舟"],
+    "max_posts_per_keyword": 10,
+    "output_dir": "./data/nga",
+    "cookies": {
+      "uid": "your_uid",
+      "username": "your_username"
+    }
+  },
+  "bilibili_crawler": {
+    "keywords": ["原神", "崩坏星穹铁道", "明日方舟"],
+    "max_videos_per_keyword": 10,
+    "output_dir": "./data/bilibili",
+    "cookies": {
+      "SESSDATA": "your_sessdata",
+      "bili_jct": "your_bili_jct"
+    }
+  },
+  "kafka": {
+    "enabled": false,
+    "bootstrap_servers": "localhost:9092",
+    "topic_context": "nga_context",
+    "topic_comment": "nga_comment"
+  },
+  "database": {
+    "enabled": true,
+    "host": "localhost",
+    "port": 3306,
+    "user": "root",
+    "password": "your_password",
+    "database": "crawler_data",
+    "charset": "utf8mb4",
+    "autocommit": true,
+    "pool_size": 10,
+    "max_overflow": 20
+  }
+}

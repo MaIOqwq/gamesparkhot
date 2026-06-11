@@ -1,0 +1,52 @@
+{
+  "cookies": {
+    "ngacn0comUserInfo": "${NGA_USER_INFO}",
+    "ngaPassportUid": "${NGA_UID}",
+    "ngaPassportUrlencodedUname": "${NGA_USERNAME}",
+    "ngaPassportCid": "${NGA_CID}",
+    "ngacn0comUserInfoCheck": "${NGA_USER_INFO_CHECK}",
+    "ngacn0comInfoCheckTime": "${NGA_INFO_CHECK_TIME}",
+    "Hm_lvt_6933ef97905336bef84f9609785bcc3d": "${NGA_HM_LVT}",
+    "HMACCOUNT": "${NGA_HMACCOUNT}",
+    "__ad_cookie_mapping_tck_731": "${NGA_AD_COOKIE}",
+    "lastvisit": "${NGA_LASTVISIT}",
+    "lastpath": "${NGA_LASTPATH}",
+    "bbsmisccookies": "${NGA_BBSMISC}",
+    "Hm_lpvt_6933ef97905336bef84f9609785bcc3d": "${NGA_HM_LPVT}"
+  },
+  "keywords": [
+    "手机游戏",
+    "王者荣耀",
+    "和平精英",
+    "原神",
+    "崩坏星穹铁道",
+    "绝区零",
+    "明日方舟",
+    "崩坏三",
+    "天涯明月刀",
+    "无限暖暖",
+    "英雄联盟手游",
+    "金铲铲之战",
+    "明日方舟终末地",
+    "三角洲行动",
+    "火影忍者手游",
+    "燕云十六声",
+    "逆水寒手游",
+    "永劫无间手游",
+    "光遇",
+    "第五人格",
+    "阴阳师"
+  ],
+  "settings": {
+    "fid": "",
+    "page": 1,
+    "delay_min": 1,
+    "delay_max": 3,
+    "output_dir": "./output"
+  },
+  "kafka": {
+    "enabled": true,
+    "bootstrap_servers": "localhost:9092",
+    "topic": "nga_crawler"
+  }
+}

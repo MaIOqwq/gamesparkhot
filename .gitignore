@@ -1,0 +1,99 @@
+# --- Java ---
+*.class
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.log
+.mvn/wrapper/maven-wrapper.jar
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.log
+# Virtual environment
+venv/
+.venv/
+env/
+
+# --- Node / Frontend ---
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+coverage/
+package-lock.json
+
+# --- IDE ---
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+.metals/
+.bloop/
+.metals-lock
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# --- Project specific ---
+*.pem
+*.p12
+*.pfx
+*.key
+.env
+*.log
+logs/
+data/
+**/jsonl/
+**/output/
+**/comparison_results/
+**/catboost_info/
+**/optimization_results/
+**/pretrained_models/
+**/packages/
+**/predictions/
+*.pt
+*.pth
+*.onnx
+*.h5
+model_training/*.json
+!model_training/configs/*.json
+!model_training/final_model/*.json
+
+# --- Spark ---
+spark/*.log
+spark/target/
+
+# --- Backend ---
+backend/target/
+backend/*.log
+
+# --- Keep example env ---
+.env.example
